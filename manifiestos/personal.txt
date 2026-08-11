@@ -17,9 +17,18 @@ secrets/stitch.key
 .config/gws/maps_api_key
 .config/gws/maps.env
 
+# Google Cloud. NO son opcionales: gws cae por defecto en las Application Default
+# Credentials cuando no encuentra las suyas, así que sin esto la bóveda tiene una
+# puerta de atrás (comprobado el 2026-08-11: con el ámbito ya cerrado, gws siguió
+# autenticando por el ADC y reescribió .config/gws/token_cache.json en disco).
+# Además el ADC tiene ámbito cloud-platform: sirve para borrar proyectos enteros.
+.config/gcloud/application_default_credentials.json
+.config/gcloud/credentials.db
+.config/gcloud/access_tokens.db
+.config/gcloud/legacy_credentials
+
 # NO incluidos a propósito:
 #   .claude.json          mezcla credenciales con el estado de todos tus proyectos;
 #                         cifrarlo deja a Claude Code sin arrancar
 #   .linkedin-mcp/        1,4 GB de perfil de navegador: no cabe en un flujo de cifrar/descifrar
-#   .config/gcloud/       descoméntalo si quieres también la sesión de gcloud
-# .config/gcloud
+#   .config/gcloud/logs   son logs, no credenciales (y ya se redactaron los que las tenían)

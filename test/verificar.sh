@@ -79,6 +79,26 @@ t "ningún resto en claro por el sandbox"
 assert '! grep -rl "token-hostinger-de-mentira" "$SB" 2>/dev/null | grep -qv "^$ORIG/"' \
        "el texto del token no aparece en ningún fichero fuera de la copia de referencia"
 
+t "cerrar dos veces NO destruye lo ya guardado"
+cat > "$LLAVE_HOME/manifiestos/personal.txt" <<'EOF'
+.config/hostinger/token
+.supabase/access-token
+.config/gws/credentials.enc
+secrets/cloudflare-personal.token
+secrets/nuevo-anadido-despues.token
+EOF
+mkdir -p "$LLAVE_ROOT/secrets"; printf 'token-anadido-luego' > "$LLAVE_ROOT/secrets/nuevo-anadido-despues.token"
+assert_fail '"$LLAVE" lock personal' "se niega a re-cerrar un ámbito ya cerrado"
+assert 'cmp -s "$LLAVE_USB/.llave/vault/personal.tar.gpg" "$LLAVE_HOME/vault/personal.tar.gpg"' "la bóveda anterior sigue intacta"
+assert '[[ -e "$LLAVE_ROOT/secrets/nuevo-anadido-despues.token" ]]' "y no ha tocado la ruta nueva"
+rm -f "$LLAVE_ROOT/secrets/nuevo-anadido-despues.token"
+cat > "$LLAVE_HOME/manifiestos/personal.txt" <<'EOF'
+.config/hostinger/token
+.supabase/access-token
+.config/gws/credentials.enc
+secrets/cloudflare-personal.token
+EOF
+
 t "sin la llave no se abre"
 mv "$LLAVE_USB/.llave" "$SB/llave-guardada"
 assert_fail '"$LLAVE" unlock personal' "unlock falla con el pendrive fuera"

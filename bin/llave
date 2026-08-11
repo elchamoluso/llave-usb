@@ -459,8 +459,14 @@ cmd_lock() {
   done
   [[ ${#presentes[@]} -gt 0 ]] || die "no hay nada que cifrar en el ámbito '$ambito'"
 
+  # Guardarraíl: volver a cerrar un ámbito YA cerrado crearía una bóveda nueva con
+  # solo lo que quede en disco, y lo que ya estaba dentro se perdería para siempre.
+  local ya_cerrado=0
+  if [[ -f "$LLAVE_HOME/vault/$ambito.tar.gpg" && ! -d "$LLAVE_RUNTIME/$ambito" ]]; then ya_cerrado=1; fi
+
   # La simulación va ANTES del PIN: sirve para revisar el manifiesto sin teclearlo
   if [[ $dry -eq 1 ]]; then
+    [[ $ya_cerrado -eq 1 ]] && warn "OJO: '$ambito' ya está cerrado. Un 'lock' real se negaría: primero 'llave unlock $ambito'."
     info "Se cifrarían ${#presentes[@]} ruta(s) del ámbito '$ambito':"
     local tam
     for rel in "${presentes[@]}"; do
@@ -469,6 +475,13 @@ cmd_lock() {
     done
     ok "simulación: no se ha tocado nada, y no ha hecho falta el PIN"
     return 0
+  fi
+
+  if [[ $ya_cerrado -eq 1 ]]; then
+    die "el ámbito '$ambito' YA está cerrado (bóveda del $(date -r "$LLAVE_HOME/vault/$ambito.tar.gpg" '+%Y-%m-%d %H:%M')).
+  Volver a cerrarlo ahora crearía una bóveda NUEVA con solo las ${#presentes[@]} ruta(s) que aún
+  están en disco, y TODO lo que ya guarda se perdería para siempre.
+  Ábrelo primero:  llave unlock $ambito"
   fi
 
   read_pin; build_pass "$usb"; canary_check "$usb"
