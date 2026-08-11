@@ -450,7 +450,6 @@ cmd_lock() {
   done
 
   local usb; usb="$(need_usb "$ambito")"
-  read_pin; build_pass "$usb"; canary_check "$usb"
 
   local -a rels=() presentes=()
   mapfile -t rels < <(read_manifest "$ambito")
@@ -460,8 +459,20 @@ cmd_lock() {
   done
   [[ ${#presentes[@]} -gt 0 ]] || die "no hay nada que cifrar en el ámbito '$ambito'"
 
+  # La simulación va ANTES del PIN: sirve para revisar el manifiesto sin teclearlo
+  if [[ $dry -eq 1 ]]; then
+    info "Se cifrarían ${#presentes[@]} ruta(s) del ámbito '$ambito':"
+    local tam
+    for rel in "${presentes[@]}"; do
+      tam="$(du -sh "$LLAVE_ROOT/$rel" 2>/dev/null | cut -f1)"
+      printf '  %-6s %s\n' "${tam:-?}" "$rel"
+    done
+    ok "simulación: no se ha tocado nada, y no ha hecho falta el PIN"
+    return 0
+  fi
+
+  read_pin; build_pass "$usb"; canary_check "$usb"
   info "Cifrando ${#presentes[@]} ruta(s) del ámbito '$ambito'…"
-  if [[ $dry -eq 1 ]]; then printf '  %s\n' "${presentes[@]}"; ok "simulación: no se ha tocado nada"; return 0; fi
 
   local tmp; TMPWORK="$(mktemp -d "${LLAVE_RUNTIME%/}.lock.XXXXXX")"; tmp="$TMPWORK"
 
