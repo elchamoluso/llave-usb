@@ -1,0 +1,25 @@
+# Ámbito PERSONAL — credenciales de jesusferreira445@gmail.com
+# Rutas relativas a tu HOME. Una por línea. '#' comenta.
+# Se cifran con 'llave lock personal' y vuelven con 'llave unlock personal'.
+
+.config/hostinger/token
+.supabase/access-token
+secrets/cloudflare-personal.token
+secrets/stitch.key
+.local/share/com.vercel.cli/auth.json
+.config/gh/hosts.yml
+
+# Google Workspace (gws): solo las credenciales, NO el directorio entero
+# (.config/gws/cache son 2,9 MB de caché de la API, ni secreta ni útil aquí)
+.config/gws/credentials.enc
+.config/gws/token_cache.json
+.config/gws/client_secret.json
+.config/gws/maps_api_key
+.config/gws/maps.env
+
+# NO incluidos a propósito:
+#   .claude.json          mezcla credenciales con el estado de todos tus proyectos;
+#                         cifrarlo deja a Claude Code sin arrancar
+#   .linkedin-mcp/        1,4 GB de perfil de navegador: no cabe en un flujo de cifrar/descifrar
+#   .config/gcloud/       descoméntalo si quieres también la sesión de gcloud
+# .config/gcloud

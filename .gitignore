@@ -1,0 +1,10 @@
+# Nunca, bajo ningún concepto, material de la llave en el repo
+*.gpg
+*.tar.gpg
+key.bin
+keyid
+papel*.txt
+paper*.txt
+.llave/
+sandbox/
+*.kdbx

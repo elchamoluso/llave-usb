@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+# llave — el pendrive como llave de credenciales y apps (Crostini / ChromeOS)
+#
+# El pendrive lleva 32 bytes aleatorios (key.bin). La frase de cifrado real es
+# base64(key.bin) + ":" + PIN, así que hacen falta las dos cosas: el pendrive y
+# el PIN. Todo el cifrado lo hace gpg simétrico (AES-256, S2K SHA-512 al máximo);
+# aquí no se inventa criptografía.
+#
+# El PIN nunca se pasa por argumentos ni se escribe en disco. LLAVE_PIN y
+# LLAVE_PAPER existen SOLO para la suite de pruebas: usarlos de verdad dejaría
+# el secreto en el historial de la shell y en el entorno.
+
+set -euo pipefail
+umask 077
+
+VERSION="1.0"
+
+# ── Rutas (las variables de entorno son para las pruebas) ─────────────────────
+LLAVE_ROOT="${LLAVE_ROOT:-$HOME}"                                 # raíz de las rutas del manifiesto
+LLAVE_HOME="${LLAVE_HOME:-$LLAVE_ROOT/.llave}"                    # keyid, espejo cifrado, manifiestos
+LLAVE_RUNTIME="${LLAVE_RUNTIME:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/llave}"   # claro, en RAM
+USB_SEARCH="${LLAVE_USB_SEARCH:-/mnt/chromeos/removable}"
+
+PASS=""   # frase de cifrado en memoria; nunca se imprime ni se escribe
+
+# Área de trabajo temporal (en RAM). Global a propósito: el trap EXIT se ejecuta
+# cuando las variables locales de la función ya no existen.
+TMPWORK=""
+limpiar() { [[ -n "${TMPWORK:-}" ]] && rm -rf "$TMPWORK"; return 0; }
+trap limpiar EXIT
+
+# ── Salida ────────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_OFF=""
+fi
+info() { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$C_OK" "$C_OFF" "$*"; }
+warn() { printf '%s!%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2; exit 1; }
+
+# ── Pendrive ──────────────────────────────────────────────────────────────────
+
+# Cualquier volumen montado (para init, cuando aún no hay llave)
+usb_candidates() {
+  if [[ -n "${LLAVE_USB:-}" ]]; then
+    [[ -d "$LLAVE_USB" ]] && printf '%s\n' "$LLAVE_USB"
+    return 0
+  fi
+  local d
+  shopt -s nullglob
+  for d in "$USB_SEARCH"/*/; do printf '%s\n' "${d%/}"; done
+  shopt -u nullglob
+}
+
+# El volumen que lleva la llave
+find_usb() {
+  local d
+  while IFS= read -r d; do
+    [[ -f "$d/.llave/key.bin" ]] && { printf '%s' "$d"; return 0; }
+  done < <(usb_candidates)
+  return 1
+}
+
+keyid_of() { sha256sum "$1" | cut -c1-16; }
+
+need_usb() {
+  local usb
+  usb="$(find_usb)" || die "llave AUSENTE: no encuentro ningún pendrive con .llave/key.bin en $USB_SEARCH
+  Enchúfalo y compártelo con Linux desde la app Archivos (clic derecho → Compartir con Linux)."
+  if [[ -f "$LLAVE_HOME/keyid" ]]; then
+    local esperado actual
+    esperado="$(cat "$LLAVE_HOME/keyid")"
+    actual="$(keyid_of "$usb/.llave/key.bin")"
+    [[ "$esperado" == "$actual" ]] || die "pendrive EQUIVOCADO: esperaba la llave $esperado y esta es $actual"
+  fi
+  printf '%s' "$usb"
+}
+
+# ── PIN y frase de cifrado ────────────────────────────────────────────────────
+PIN=""
+read_pin() {
+  if [[ -n "${LLAVE_PIN:-}" ]]; then PIN="$LLAVE_PIN"; return 0; fi
+  [[ -t 0 ]] || die "hace falta el PIN y no hay terminal interactiva (ejecútalo tú en una terminal)"
+  printf 'PIN de la llave: ' >&2
+  IFS= read -rs PIN; printf '\n' >&2
+  [[ -n "$PIN" ]] || die "PIN vacío"
+}
+
+build_pass() { # $1 = raíz del pendrive
+  local k
+  k="$(base64 -w0 < "$1/.llave/key.bin")"
+  PASS="${k}:${PIN}"
+}
+
+# gpg: la frase entra por una tubería (process substitution), nunca por argv ni disco
+enc() {
+  gpg --batch --quiet --yes --no-symkey-cache --pinentry-mode loopback \
+      --symmetric --cipher-algo AES256 \
+      --s2k-mode 3 --s2k-digest-algo SHA512 --s2k-count 65011712 \
+      --passphrase-file <(printf '%s' "$PASS")
+}
+dec() {
+  gpg --batch --quiet --no-symkey-cache --pinentry-mode loopback \
+      --decrypt --passphrase-file <(printf '%s' "$PASS")
+}
+
+# Fichero centinela: valida el PIN sin tocar ninguna bóveda real
+canary_write() { # $1 = usb
+  local id; id="$(keyid_of "$1/.llave/key.bin")"
+  printf 'llave-ok:%s' "$id" | enc > "$1/.llave/canary.gpg"
+}
+canary_check() { # $1 = usb
+  local id esperado
+  id="$(keyid_of "$1/.llave/key.bin")"
+  esperado="llave-ok:$id"
+  [[ -f "$1/.llave/canary.gpg" ]] || die "falta el centinela: el pendrive está a medio inicializar"
+  local got
+  got="$(dec < "$1/.llave/canary.gpg" 2>/dev/null)" || die "PIN incorrecto"
+  [[ "$got" == "$esperado" ]] || die "PIN incorrecto o centinela corrupto"
+}
+
+# ── Manifiestos ───────────────────────────────────────────────────────────────
+manifest_path() { printf '%s' "$LLAVE_HOME/manifiestos/$1.txt"; }
+
+read_manifest() { # $1 = ámbito → una ruta relativa por línea
+  local man; man="$(manifest_path "$1")"
+  [[ -f "$man" ]] || die "no existe el manifiesto $man"
+  local line
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"   # trim izquierda
+    line="${line%"${line##*[![:space:]]}"}"   # trim derecha
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == /* ]] && die "ruta absoluta en el manifiesto: $line (deben ser relativas a $LLAVE_ROOT)"
+    [[ "$line" == *..* ]] && die "ruta con .. en el manifiesto: $line"
+    printf '%s\n' "$line"
+  done < "$man"
+}
+
+# sha256 de cada fichero bajo las rutas dadas, siguiendo enlaces, ordenado
+hash_set() { # $1 = base; resto = rutas relativas
+  local base="$1"; shift
+  local rel f
+  for rel in "$@"; do
+    [[ -e "$base/$rel" ]] || continue
+    while IFS= read -r f; do
+      printf '%s  %s\n' "$(sha256sum < "$f" | cut -d' ' -f1)" "${f#"$base/"}"
+    done < <(find -L "$base/$rel" -type f 2>/dev/null | sort)
+  done
+}
+
+# ── init ──────────────────────────────────────────────────────────────────────
+cmd_init() {
+  local force=0 usb=""
+  local -a cands=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      --usb) usb="${2:-}"; shift ;;
+      *) die "opción desconocida: $1" ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$usb" ]]; then
+    mapfile -t cands < <(usb_candidates)
+    [[ ${#cands[@]} -gt 0 ]] || die "no veo ningún volumen en $USB_SEARCH: enchufa el pendrive y compártelo con Linux"
+    [[ ${#cands[@]} -eq 1 ]] || die "hay varios volúmenes; elige uno con --usb '<ruta>':
+$(printf '  %s\n' "${cands[@]}")"
+    usb="${cands[0]}"
+  fi
+  [[ -d "$usb" ]] || die "no existe: $usb"
+  [[ -w "$usb" ]] || die "no puedo escribir en $usb"
+
+  if [[ -f "$usb/.llave/key.bin" && $force -eq 0 ]]; then
+    die "ese pendrive YA tiene una llave ($(keyid_of "$usb/.llave/key.bin")).
+  Usa --force solo si quieres tirarla: todo lo cifrado con ella quedaría ilegible."
+  fi
+
+  info "Pendrive: $usb"
+  info "El PIN es el segundo factor. Mínimo 8 caracteres — con 4 dígitos, quien"
+  info "te robe el pendrive lo revienta en minutos."
+  if [[ -z "${LLAVE_PIN:-}" ]]; then
+    [[ -t 0 ]] || die "ejecuta 'llave init' tú, en una terminal (hay que teclear el PIN)"
+    local pin1 pin2
+    printf 'PIN nuevo: ' >&2;    IFS= read -rs pin1; printf '\n' >&2
+    printf 'Repite el PIN: ' >&2; IFS= read -rs pin2; printf '\n' >&2
+    [[ "$pin1" == "$pin2" ]] || die "los PIN no coinciden"
+    PIN="$pin1"
+  else
+    PIN="$LLAVE_PIN"
+  fi
+  [[ ${#PIN} -ge 8 ]] || die "PIN demasiado corto (${#PIN} caracteres, mínimo 8)"
+
+  mkdir -p "$usb/.llave/vault" "$LLAVE_HOME/vault" "$LLAVE_HOME/manifiestos"
+  head -c 32 /dev/urandom > "$usb/.llave/key.bin"
+  chmod 600 "$usb/.llave/key.bin" 2>/dev/null || true   # FAT ignora permisos; no es un fallo
+
+  local id; id="$(keyid_of "$usb/.llave/key.bin")"
+  printf '%s' "$id" > "$usb/.llave/keyid"
+  printf '%s' "$id" > "$LLAVE_HOME/keyid"
+
+  build_pass "$usb"
+  canary_write "$usb"
+  canary_check "$usb"
+
+  # Manifiestos de partida (no se pisa ninguno que ya exista)
+  local plantillas dest p
+  plantillas="$(dirname "$(readlink -f "$0")")/../manifiestos"
+  shopt -s nullglob
+  for p in "$plantillas"/*.txt; do
+    dest="$LLAVE_HOME/manifiestos/$(basename "$p")"
+    [[ -f "$dest" ]] || { cp "$p" "$dest"; ok "manifiesto $(basename "$p" .txt) → $dest"; }
+  done
+  shopt -u nullglob
+
+  ok "llave creada — id $id"
+  echo
+  cmd_paper
+}
+
+# ── adoptar ───────────────────────────────────────────────────────────────────
+# Segunda máquina con el MISMO pendrive: registra aquí una llave ya creada, sin
+# tocarla. (Con un pendrive distinto lo que toca es 'llave init'.)
+cmd_adoptar() {
+  local usb
+  usb="$(find_usb)" || die "no veo ningún pendrive con .llave/key.bin en $USB_SEARCH"
+  [[ -f "$LLAVE_HOME/keyid" ]] && die "esta máquina ya conoce la llave $(cat "$LLAVE_HOME/keyid")"
+
+  read_pin; build_pass "$usb"; canary_check "$usb"
+
+  mkdir -p "$LLAVE_HOME/vault" "$LLAVE_HOME/manifiestos"
+  local id; id="$(keyid_of "$usb/.llave/key.bin")"
+  printf '%s' "$id" > "$LLAVE_HOME/keyid"
+
+  local plantillas dest p n=0
+  plantillas="$(dirname "$(readlink -f "$0")")/../manifiestos"
+  shopt -s nullglob
+  for p in "$plantillas"/*.txt; do
+    dest="$LLAVE_HOME/manifiestos/$(basename "$p")"
+    [[ -f "$dest" ]] || cp "$p" "$dest"
+  done
+  for p in "$usb/.llave/vault"/*.tar.gpg; do cp "$p" "$LLAVE_HOME/vault/"; n=$((n+1)); done
+  shopt -u nullglob
+
+  ok "llave $id adoptada en esta máquina ($n bóveda(s) copiadas al espejo local)"
+  info "  Revisa los manifiestos de $LLAVE_HOME/manifiestos antes del primer 'llave lock'."
+}
+
+# ── paper ─────────────────────────────────────────────────────────────────────
+cmd_paper() {
+  local usb; usb="$(need_usb)"
+  local b64 id
+  b64="$(base64 -w0 < "$usb/.llave/key.bin")"
+  id="$(keyid_of "$usb/.llave/key.bin")"
+  cat <<EOF
+┌─ RESPALDO EN PAPEL ─────────────────────────────────────────────────────────┐
+│ Imprímelo o cópialo A MANO y guárdalo fuera de la casa del portátil.        │
+│ Con esta cadena + tu PIN se reconstruye la llave: 'llave restore'.          │
+│ Sin ella, si pierdes el pendrive, la bóveda es irrecuperable.               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  clave : $b64
+  id    : $id
+  fecha : $(date +%Y-%m-%d)
+
+EOF
+  warn "esta pantalla contiene la clave: no la dejes en el historial de un chat ni en una captura"
+}
+
+# ── restore ───────────────────────────────────────────────────────────────────
+cmd_restore() {
+  local usb="${1:-}"
+  local -a cands=()
+  if [[ -z "$usb" ]]; then
+    mapfile -t cands < <(usb_candidates)
+    [[ ${#cands[@]} -eq 1 ]] || die "indica el pendrive: llave restore '<ruta>'"
+    usb="${cands[0]}"
+  fi
+  [[ -w "$usb" ]] || die "no puedo escribir en $usb"
+  [[ -f "$usb/.llave/key.bin" ]] && die "ese pendrive ya tiene llave; borra .llave/key.bin a mano si quieres sobrescribirla"
+
+  local b64
+  if [[ -n "${LLAVE_PAPER:-}" ]]; then
+    b64="$LLAVE_PAPER"
+  else
+    [[ -t 0 ]] || die "ejecuta 'llave restore' tú, en una terminal"
+    printf 'Clave del papel (44 caracteres, no se verá): ' >&2
+    IFS= read -rs b64; printf '\n' >&2
+  fi
+
+  mkdir -p "$usb/.llave/vault"
+  printf '%s' "$b64" | base64 -d > "$usb/.llave/key.bin" 2>/dev/null || die "esa cadena no es base64 válido"
+  [[ "$(stat -c%s "$usb/.llave/key.bin")" == "32" ]] || { rm -f "$usb/.llave/key.bin"; die "la clave no mide 32 bytes: ¿falta algún carácter?"; }
+
+  local id; id="$(keyid_of "$usb/.llave/key.bin")"
+  printf '%s' "$id" > "$usb/.llave/keyid"
+  if [[ -f "$LLAVE_HOME/keyid" && "$(cat "$LLAVE_HOME/keyid")" != "$id" ]]; then
+    rm -f "$usb/.llave/key.bin"
+    die "la clave restaurada ($id) no es la de esta máquina ($(cat "$LLAVE_HOME/keyid")): revisa la transcripción del papel"
+  fi
+  printf '%s' "$id" > "$LLAVE_HOME/keyid"
+
+  # Repone el cifrado desde el espejo del disco, si lo hay
+  mkdir -p "$LLAVE_HOME/vault"
+  local f n=0
+  shopt -s nullglob
+  for f in "$LLAVE_HOME/vault"/*.tar.gpg; do cp "$f" "$usb/.llave/vault/"; n=$((n+1)); done
+  shopt -u nullglob
+
+  read_pin; build_pass "$usb"; canary_write "$usb"; canary_check "$usb"
+  ok "llave $id restaurada en $usb ($n bóveda(s) repuestas desde el espejo)"
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+cmd_status() {
+  local usb
+  if usb="$(find_usb 2>/dev/null)"; then
+    local id; id="$(keyid_of "$usb/.llave/key.bin")"
+    if [[ -f "$LLAVE_HOME/keyid" && "$(cat "$LLAVE_HOME/keyid")" != "$id" ]]; then
+      warn "hay un pendrive con llave $id, pero esta máquina espera $(cat "$LLAVE_HOME/keyid")"
+    else
+      ok "llave PRESENTE — id $id — $usb"
+    fi
+  else
+    printf '%s✗%s llave AUSENTE (enchufa el pendrive y compártelo con Linux desde Archivos)\n' "$C_ERR" "$C_OFF"
+  fi
+
+  local man ambito
+  shopt -s nullglob
+  for man in "$LLAVE_HOME/manifiestos"/*.txt; do
+    ambito="$(basename "$man" .txt)"
+    local abierta="cerrada" vault="—" nclaro=0 rel
+    [[ -d "$LLAVE_RUNTIME/$ambito" ]] && abierta="ABIERTA (en RAM)"
+    if [[ -n "${usb:-}" && -f "$usb/.llave/vault/$ambito.tar.gpg" ]]; then
+      vault="$(date -r "$usb/.llave/vault/$ambito.tar.gpg" '+%Y-%m-%d %H:%M')"
+    elif [[ -f "$LLAVE_HOME/vault/$ambito.tar.gpg" ]]; then
+      vault="$(date -r "$LLAVE_HOME/vault/$ambito.tar.gpg" '+%Y-%m-%d %H:%M') (solo espejo)"
+    fi
+    while IFS= read -r rel; do
+      [[ -e "$LLAVE_ROOT/$rel" && ! -L "$LLAVE_ROOT/$rel" ]] && nclaro=$((nclaro+1))
+    done < <(read_manifest "$ambito")
+    printf '\n  ámbito %-12s %s\n' "$ambito" "$abierta"
+    printf '    bóveda cifrada : %s\n' "$vault"
+    printf '    en claro en disco: %s ruta(s)%s\n' "$nclaro" \
+      "$( [[ $nclaro -gt 0 ]] && printf ' %s← sin cifrar todavía%s' "$C_WARN" "$C_OFF" )"
+  done
+  shopt -u nullglob
+
+  local -a apps=()
+  mapfile -t apps < <(apps_protegidas)
+  printf '\n  apps con candado: %s\n' "$( [[ ${#apps[@]} -gt 0 ]] && printf '%s ' "${apps[@]}" || printf '(ninguna)' )"
+}
+
+# ── lock ──────────────────────────────────────────────────────────────────────
+cmd_lock() {
+  local ambito="personal" dry=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      -*) die "opción desconocida: $1" ;;
+      *) ambito="$1" ;;
+    esac
+    shift
+  done
+
+  local usb; usb="$(need_usb)"
+  read_pin; build_pass "$usb"; canary_check "$usb"
+
+  local -a rels=() presentes=()
+  mapfile -t rels < <(read_manifest "$ambito")
+  local rel
+  for rel in "${rels[@]}"; do
+    if [[ -e "$LLAVE_ROOT/$rel" ]]; then presentes+=("$rel"); else warn "no existe, se omite: $rel"; fi
+  done
+  [[ ${#presentes[@]} -gt 0 ]] || die "no hay nada que cifrar en el ámbito '$ambito'"
+
+  info "Cifrando ${#presentes[@]} ruta(s) del ámbito '$ambito'…"
+  if [[ $dry -eq 1 ]]; then printf '  %s\n' "${presentes[@]}"; ok "simulación: no se ha tocado nada"; return 0; fi
+
+  local tmp; TMPWORK="$(mktemp -d "${LLAVE_RUNTIME%/}.lock.XXXXXX")"; tmp="$TMPWORK"
+
+  # 1. huella de lo vivo (siguiendo enlaces: sirve tanto si es fichero real como si es enlace al tmpfs)
+  hash_set "$LLAVE_ROOT" "${presentes[@]}" > "$tmp/antes.sha"
+
+  # 2. cifrar
+  tar -C "$LLAVE_ROOT" -chf - -- "${presentes[@]}" | enc > "$tmp/nuevo.tar.gpg"
+
+  # 3. VERIFICAR antes de borrar nada: descifrar, extraer y comparar huella
+  mkdir -p "$tmp/check"
+  dec < "$tmp/nuevo.tar.gpg" | tar -C "$tmp/check" -xf - \
+    || die "el archivo recién cifrado no se puede descifrar: NO se ha borrado nada"
+  hash_set "$tmp/check" "${presentes[@]}" > "$tmp/despues.sha"
+  diff -q "$tmp/antes.sha" "$tmp/despues.sha" >/dev/null \
+    || die "la copia cifrada no coincide byte a byte con el original: NO se ha borrado nada"
+  ok "verificado: la bóveda reproduce $(wc -l < "$tmp/antes.sha") fichero(s) idénticos"
+
+  # 4. publicar (pendrive + espejo)
+  mkdir -p "$usb/.llave/vault" "$LLAVE_HOME/vault"
+  cp "$tmp/nuevo.tar.gpg" "$usb/.llave/vault/$ambito.tar.gpg"
+  cp "$tmp/nuevo.tar.gpg" "$LLAVE_HOME/vault/$ambito.tar.gpg"
+
+  # 5. ahora sí, retirar el claro
+  for rel in "${presentes[@]}"; do rm -rf "${LLAVE_ROOT:?}/$rel"; done
+  rm -rf "${LLAVE_RUNTIME:?}/$ambito"
+
+  ok "ámbito '$ambito' cerrado: fuera del disco, solo en el pendrive (y el espejo cifrado)"
+  info "  Para volver a trabajar: llave unlock $ambito"
+}
+
+# ── unlock ────────────────────────────────────────────────────────────────────
+cmd_unlock() {
+  local ambito="personal" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      -*) die "opción desconocida: $1" ;;
+      *) ambito="$1" ;;
+    esac
+    shift
+  done
+
+  local usb; usb="$(need_usb)"
+  read_pin; build_pass "$usb"; canary_check "$usb"
+
+  local vault="$usb/.llave/vault/$ambito.tar.gpg"
+  [[ -f "$vault" ]] || vault="$LLAVE_HOME/vault/$ambito.tar.gpg"
+  [[ -f "$vault" ]] || die "no hay bóveda para el ámbito '$ambito'"
+
+  local dest="$LLAVE_RUNTIME/$ambito"
+  mkdir -p "$dest"; chmod 700 "$LLAVE_RUNTIME" "$dest"
+  dec < "$vault" | tar -C "$dest" -xf - || die "no se pudo descifrar la bóveda"
+
+  local rel n=0
+  while IFS= read -r rel; do
+    local real="$LLAVE_ROOT/$rel" dentro="$dest/$rel"
+    [[ -e "$dentro" ]] || continue
+    if [[ -L "$real" ]]; then
+      # enlace de una sesión anterior (tras reiniciar apunta al vacío): se rehace
+      rm -f "$real"
+    elif [[ -e "$real" ]]; then
+      if [[ $force -eq 0 ]]; then
+        die "$rel ya existe en claro en el disco. Compara y decide:
+  - si es el bueno:  llave lock $ambito   (lo mete en la bóveda)
+  - si sobra:        llave unlock $ambito --force   (lo aparta a $LLAVE_HOME/apartados/)"
+      fi
+      local bak="$LLAVE_HOME/apartados/$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$bak/$(dirname "$rel")"; mv "$real" "$bak/$rel"
+      warn "apartado a $bak/$rel"
+    fi
+    mkdir -p "$(dirname "$real")"
+    ln -s "$dentro" "$real"
+    n=$((n+1))
+  done < <(read_manifest "$ambito")
+
+  ok "ámbito '$ambito' abierto: $n ruta(s) enlazadas a RAM ($dest)"
+  info "  Se cierra solo al reiniciar. Para cerrarlo ya: llave lock $ambito"
+}
+
+# ── sync ──────────────────────────────────────────────────────────────────────
+cmd_sync() {
+  local ambito="${1:-personal}"
+  local usb; usb="$(need_usb)"
+  [[ -d "$LLAVE_RUNTIME/$ambito" ]] || die "el ámbito '$ambito' no está abierto: no hay cambios que guardar"
+  read_pin; build_pass "$usb"; canary_check "$usb"
+
+  local -a presentes=()
+  local rel
+  while IFS= read -r rel; do [[ -e "$LLAVE_ROOT/$rel" ]] && presentes+=("$rel"); done < <(read_manifest "$ambito")
+  [[ ${#presentes[@]} -gt 0 ]] || die "no hay nada abierto que guardar"
+
+  local tmp; TMPWORK="$(mktemp -d "${LLAVE_RUNTIME%/}.sync.XXXXXX")"; tmp="$TMPWORK"
+  hash_set "$LLAVE_ROOT" "${presentes[@]}" > "$tmp/antes.sha"
+  tar -C "$LLAVE_ROOT" -chf - -- "${presentes[@]}" | enc > "$tmp/nuevo.tar.gpg"
+  mkdir -p "$tmp/check"
+  dec < "$tmp/nuevo.tar.gpg" | tar -C "$tmp/check" -xf - || die "el archivo cifrado no se puede descifrar: bóveda anterior intacta"
+  hash_set "$tmp/check" "${presentes[@]}" > "$tmp/despues.sha"
+  diff -q "$tmp/antes.sha" "$tmp/despues.sha" >/dev/null || die "la copia no coincide: bóveda anterior intacta"
+
+  cp "$tmp/nuevo.tar.gpg" "$usb/.llave/vault/$ambito.tar.gpg"
+  cp "$tmp/nuevo.tar.gpg" "$LLAVE_HOME/vault/$ambito.tar.gpg"
+  ok "bóveda '$ambito' actualizada con los cambios en curso"
+}
+
+# ── run (candado de apps) ─────────────────────────────────────────────────────
+avisar() { # $1 = título, $2 = texto
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -u critical "$1" "$2" || true
+  elif [[ -t 1 ]] && command -v whiptail >/dev/null 2>&1; then
+    whiptail --title "$1" --msgbox "$2" 10 70 || true
+  fi
+  printf '%s: %s\n' "$1" "$2" >&2
+}
+
+cmd_run() {
+  [[ "${1:-}" == "--" ]] && shift
+  [[ $# -gt 0 ]] || die "uso: llave run -- <comando> [args]"
+  if ! find_usb >/dev/null 2>&1; then
+    avisar "Llave ausente" "Enchufa el pendrive y compártelo con Linux (Archivos → clic derecho → Compartir con Linux) para abrir: $(basename "$1")"
+    exit 1
+  fi
+  exec "$@"
+}
+
+APPS_DIR="${LLAVE_APPS_DIR:-$LLAVE_ROOT/.local/share/applications}"
+APPS_SYS="${LLAVE_APPS_SYS:-/usr/share/applications}"
+
+cmd_proteger() {
+  local app="${1:-}"
+  [[ -n "$app" ]] || die "uso: llave proteger <app>   (el nombre del .desktop, p.ej. obsidian)"
+  app="${app%.desktop}"
+  local sys="$APPS_SYS/$app.desktop"
+  [[ -f "$sys" ]] || die "no encuentro $sys
+  Apps disponibles: ls $APPS_SYS | sed 's/\.desktop//'"
+  local dest="$APPS_DIR/$app.desktop"
+  if [[ -f "$dest" ]] && ! grep -q 'llave run' "$dest"; then
+    die "ya tienes un $dest propio; apártalo tú antes (no lo piso yo)"
+  fi
+  local self; self="$(readlink -f "$0")"
+  mkdir -p "$APPS_DIR"
+  # Reescribe TODOS los Exec= (incluidos los de [Desktop Action …])
+  sed -E "s|^Exec=(.*)\$|Exec=$self run -- \1|" "$sys" > "$dest"
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" 2>/dev/null || true
+  ok "'$app' protegido: sin el pendrive no arranca desde el lanzador de ChromeOS"
+  info "  Se quita con: llave desproteger $app"
+}
+
+cmd_desproteger() {
+  local app="${1:-}"
+  [[ -n "$app" ]] || die "uso: llave desproteger <app>"
+  app="${app%.desktop}"
+  local dest="$APPS_DIR/$app.desktop"
+  [[ -f "$dest" ]] || die "no está protegido: no existe $dest"
+  grep -q 'llave run' "$dest" || die "$dest no lo creé yo; bórralo tú si quieres"
+  rm -f "$dest"
+  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_DIR" 2>/dev/null || true
+  ok "'$app' vuelve a arrancar sin llave"
+}
+
+# ── keepass: contraseñas de webs y apps de ChromeOS/Android ───────────────────
+# La base vive en el pendrive y se abre con dos cosas: key.bin como key file y
+# el PIN como contraseña. Sin el pendrive no hay nada que abrir.
+cmd_keepass() {
+  local sub="${1:-abrir}"
+  local usb; usb="$(need_usb)"
+  local db="$usb/.llave/passwords.kdbx"
+
+  case "$sub" in
+    init)
+      command -v keepassxc-cli >/dev/null || die "falta keepassxc: sudo apt install keepassxc"
+      [[ -f "$db" ]] && die "ya existe $db"
+      read_pin
+      printf '%s\n%s\n' "$PIN" "$PIN" \
+        | keepassxc-cli db-create --set-key-file "$usb/.llave/key.bin" --set-password "$db" >/dev/null \
+        || die "keepassxc-cli no pudo crear la base"
+      ok "base de contraseñas creada en el pendrive"
+      info "  Ábrela con: llave keepass    (o desde el lanzador: KeePassXC)"
+      ;;
+    abrir)
+      [[ -f "$db" ]] || die "no hay base todavía: llave keepass init"
+      command -v keepassxc >/dev/null || die "falta keepassxc: sudo apt install keepassxc"
+      exec keepassxc --keyfile "$usb/.llave/key.bin" "$db"
+      ;;
+    ruta) printf '%s\n' "$db" ;;
+    *) die "uso: llave keepass [init|abrir|ruta]" ;;
+  esac
+}
+
+apps_protegidas() {
+  local f
+  shopt -s nullglob
+  for f in "$APPS_DIR"/*.desktop; do
+    grep -q 'llave run' "$f" && basename "$f" .desktop
+  done
+  shopt -u nullglob
+}
+
+# ── selftest ──────────────────────────────────────────────────────────────────
+cmd_selftest() {
+  local usb; usb="$(need_usb)"
+  read_pin; build_pass "$usb"; canary_check "$usb"
+  ok "pendrive y PIN correctos (centinela descifrado)"
+
+  local tmp; TMPWORK="$(mktemp -d "${LLAVE_RUNTIME%/}.selftest.XXXXXX")"; tmp="$TMPWORK"
+  head -c 4096 /dev/urandom > "$tmp/muestra.bin"
+  enc < "$tmp/muestra.bin" > "$tmp/muestra.gpg"
+  dec < "$tmp/muestra.gpg" > "$tmp/vuelta.bin"
+  cmp -s "$tmp/muestra.bin" "$tmp/vuelta.bin" || die "ida y vuelta de cifrado FALLA"
+  ok "cifrado ida y vuelta correcto (AES-256, 4 KB de prueba)"
+
+  local b64 id
+  b64="$(base64 -w0 < "$usb/.llave/key.bin")"
+  printf '%s' "$b64" | base64 -d > "$tmp/papel.bin"
+  cmp -s "$usb/.llave/key.bin" "$tmp/papel.bin" || die "la cadena del papel NO reconstruye la clave"
+  id="$(keyid_of "$tmp/papel.bin")"
+  [[ "$id" == "$(keyid_of "$usb/.llave/key.bin")" ]] || die "el id del papel no coincide"
+  ok "el respaldo en papel reconstruye la clave (id $id)"
+
+  local mal
+  mal="$(PIN="pin-que-no-es-$RANDOM"; build_pass "$usb"; dec < "$usb/.llave/canary.gpg" 2>/dev/null || true)"
+  [[ -z "$mal" ]] || die "un PIN incorrecto ha descifrado el centinela"
+  ok "un PIN incorrecto no abre nada"
+}
+
+# ── ayuda ─────────────────────────────────────────────────────────────────────
+cmd_help() {
+  cat <<'EOF'
+llave — el pendrive como llave de credenciales y apps
+
+  llave init [--usb RUTA]     crea la llave en el pendrive, pide PIN, imprime el papel
+  llave adoptar               registra en ESTA máquina una llave ya creada (2.ª máquina)
+  llave status                ¿está la llave? ¿qué ámbitos hay abiertos o en claro?
+  llave lock   [ámbito]       cifra las rutas del manifiesto y las quita del disco
+  llave unlock [ámbito]       descifra a RAM y enlaza las rutas reales
+  llave sync   [ámbito]       vuelve a cifrar tras cambios (p.ej. un login nuevo)
+  llave run -- CMD [args]     ejecuta CMD solo si la llave está puesta
+  llave proteger APP          pone el candado a una app del lanzador (p.ej. obsidian)
+  llave desproteger APP       se lo quita
+  llave keepass [init|abrir]  base de contraseñas en el pendrive (webs, apps de ChromeOS)
+  llave paper                 reimprime el respaldo en papel
+  llave restore [RUTA]        reconstruye el pendrive desde el papel
+  llave selftest              comprueba llave, PIN, cifrado y respaldo
+
+El ámbito por defecto es 'personal'. Los manifiestos viven en
+~/.llave/manifiestos/<ámbito>.txt, con rutas relativas a tu HOME.
+EOF
+}
+
+# ── dispatch ──────────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-status}"; shift || true
+  case "$cmd" in
+    init)     cmd_init "$@" ;;
+    adoptar)  cmd_adoptar "$@" ;;
+    status)   cmd_status "$@" ;;
+    lock)     cmd_lock "$@" ;;
+    unlock)   cmd_unlock "$@" ;;
+    sync)     cmd_sync "$@" ;;
+    run)      cmd_run "$@" ;;
+    keepass)  cmd_keepass "$@" ;;
+    proteger) cmd_proteger "$@" ;;
+    desproteger) cmd_desproteger "$@" ;;
+    paper)    cmd_paper "$@" ;;
+    restore)  cmd_restore "$@" ;;
+    selftest) cmd_selftest "$@" ;;
+    -h|--help|help) cmd_help ;;
+    --version) printf 'llave %s\n' "$VERSION" ;;
+    *) die "orden desconocida: $cmd (prueba 'llave --help')" ;;
+  esac
+}
+main "$@"

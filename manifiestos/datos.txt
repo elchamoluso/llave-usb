@@ -1,0 +1,8 @@
+# Ámbito DATOS — ficheros sensibles que no son credenciales de login
+# 'llave lock datos' / 'llave unlock datos'. Independiente del ámbito personal:
+# puedes tener las credenciales abiertas y estos datos cerrados.
+
+secrets/ipnj-dump-2026-08-04.json
+secrets/ipnj-dump-2026-08-04-pre-limpeza.json
+secrets/ipnj-dump-2026-08-03.json.gpg
+secrets/from-drive-2026-06-06
