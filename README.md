@@ -4,7 +4,9 @@ Un pendrive corriente que desbloquea tus credenciales y tus apps de Linux en el
 Chromebook. Bash + `gpg` simétrico; aquí no se inventa criptografía.
 
 ```
-llave init          crea la llave en el pendrive, pide PIN, imprime el respaldo en papel
+llave init          crea una llave en el pendrive, pide PIN, imprime el respaldo en papel
+llave adoptar       registra en ESTA máquina una llave ya creada (segunda máquina)
+llave llaves        qué llaves conoce la máquina y qué ámbito abre cada una
 llave status        ¿está la llave? ¿qué hay abierto, cerrado o todavía en claro?
 llave lock   [ámb]  cifra las rutas del manifiesto y las QUITA del disco
 llave unlock [ámb]  descifra a RAM (tmpfs) y enlaza las rutas reales
@@ -25,11 +27,27 @@ El pendrive lleva 32 bytes aleatorios (`key.bin`). La frase de cifrado real es
 
 ```
 <USB>/.llave/                 ~/.llave/                    /run/user/1000/llave/
-  key.bin    la llave           keyid                        <ámbito>/…
-  keyid                         vault/*.tar.gpg  (espejo)    ← el claro, solo en RAM
-  vault/personal.tar.gpg        manifiestos/*.txt
-  passwords.kdbx                apartados/
+  key.bin    la llave           llaves/<keyid> → nombre       <ámbito>/…
+  keyid                         duenos/<ámbito> → keyid       ← el claro, solo en RAM
+  vault/personal.tar.gpg        vault/*.tar.gpg  (espejo)
+  passwords.kdbx                manifiestos/*.txt · apartados/
 ```
+
+## Una llave por entidad
+
+Una máquina puede conocer **varias llaves**: un pendrive personal, otro de IPNJ, otro del
+negocio. Cada ámbito queda atado a la llave con la que se cerró la primera vez (`duenos/`),
+así que **el pendrive de IPNJ no abre lo personal y viceversa** — enchufas la llave de aquello
+en lo que vas a trabajar y el resto sigue cifrado.
+
+```bash
+llave init --nombre ipnj     # con el pendrive de IPNJ puesto; PIN propio
+llave lock ipnj              # ese ámbito queda atado a esa llave
+```
+
+Un `llave init` con un pendrive nuevo **no desbanca** a las llaves ya registradas. Para
+registrar en otra máquina una llave que ya existe, `llave adoptar` (nunca `init --force`,
+que genera una clave nueva y deja ilegible todo lo cifrado con la anterior).
 
 Con la bóveda abierta, `~/.config/hostinger/token` (y las demás rutas) son **enlaces
 al tmpfs**: el texto en claro nunca toca el disco. Al reiniciar, el tmpfs se vacía y
@@ -87,10 +105,11 @@ el pendrive los prueba todos en minutos aunque el S2K sea el máximo.
 ./test/verificar.sh
 ```
 
-20 comprobaciones en un sandbox: ni toca tus secretos ni tu pendrive. Cubre el ciclo
+26 comprobaciones en un sandbox: ni toca tus secretos ni tu pendrive. Cubre el ciclo
 completo (init → lock → unlock → sync → reinicio simulado → pérdida del pendrive →
 restauración desde el papel), los guardarraíles (no borra sin verificar, no pisa
-ficheros tuyos, rechaza PIN corto o incorrecto) y las fases 3 y 4.
+ficheros tuyos, rechaza PIN corto o incorrecto), la convivencia de dos llaves
+(cada una abre solo su ámbito) y las fases 3 y 4.
 
 `LLAVE_PIN` y `LLAVE_PAPER` existen **solo** para esa suite: usarlas de verdad dejaría
 el secreto en el historial de la shell y en el entorno.

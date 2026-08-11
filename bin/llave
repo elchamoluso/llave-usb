@@ -54,27 +54,70 @@ usb_candidates() {
   shopt -u nullglob
 }
 
-# El volumen que lleva la llave
-find_usb() {
+keyid_of() { sha256sum "$1" | cut -c1-16; }
+
+# ── Llaves conocidas por esta máquina ─────────────────────────────────────────
+# Una máquina puede conocer VARIAS llaves, una por entidad (personal, ipnj…).
+#   llaves/<keyid>  → el nombre de esa llave
+#   duenos/<ámbito> → qué llave abre ese ámbito
+# Así el pendrive de IPNJ solo abre lo de IPNJ, y el personal solo lo personal.
+
+migrar_llave_unica() {   # compatibilidad con el formato viejo de una sola llave
+  [[ -f "$LLAVE_HOME/keyid" ]] || return 0
+  local id; id="$(cat "$LLAVE_HOME/keyid")"
+  [[ -n "$id" ]] || { rm -f "$LLAVE_HOME/keyid"; return 0; }
+  mkdir -p "$LLAVE_HOME/llaves" "$LLAVE_HOME/duenos"
+  [[ -f "$LLAVE_HOME/llaves/$id" ]] || printf 'personal' > "$LLAVE_HOME/llaves/$id"
+  local v amb
+  shopt -s nullglob
+  for v in "$LLAVE_HOME/vault"/*.tar.gpg; do
+    amb="$(basename "$v" .tar.gpg)"
+    [[ -f "$LLAVE_HOME/duenos/$amb" ]] || printf '%s' "$id" > "$LLAVE_HOME/duenos/$amb"
+  done
+  shopt -u nullglob
+  rm -f "$LLAVE_HOME/keyid"
+}
+
+registrar_llave() { mkdir -p "$LLAVE_HOME/llaves"; printf '%s' "${2:-sin-nombre}" > "$LLAVE_HOME/llaves/$1"; }
+nombre_de()   { cat "$LLAVE_HOME/llaves/$1" 2>/dev/null || printf 'desconocida'; }
+conocida()    { [[ -f "$LLAVE_HOME/llaves/$1" ]]; }
+dueno_de()    { cat "$LLAVE_HOME/duenos/$1" 2>/dev/null || true; }
+fijar_dueno() { mkdir -p "$LLAVE_HOME/duenos"; printf '%s' "$2" > "$LLAVE_HOME/duenos/$1"; }
+
+# "keyid<TAB>ruta" por cada pendrive con llave que esté puesto
+usb_con_llave() {
   local d
   while IFS= read -r d; do
-    [[ -f "$d/.llave/key.bin" ]] && { printf '%s' "$d"; return 0; }
+    [[ -f "$d/.llave/key.bin" ]] && printf '%s\t%s\n' "$(keyid_of "$d/.llave/key.bin")" "$d"
   done < <(usb_candidates)
+}
+
+find_usb() {   # $1 = keyid concreto (opcional)
+  local want="${1:-}" id ruta
+  while IFS=$'\t' read -r id ruta; do
+    [[ -z "$want" || "$id" == "$want" ]] && { printf '%s' "$ruta"; return 0; }
+  done < <(usb_con_llave)
   return 1
 }
 
-keyid_of() { sha256sum "$1" | cut -c1-16; }
+need_usb() {   # $1 = ámbito (opcional): exige la llave DUEÑA de ese ámbito
+  local amb="${1:-}" want="" usb="" id ruta n=0
+  [[ -n "$amb" ]] && want="$(dueno_de "$amb")"
 
-need_usb() {
-  local usb
-  usb="$(find_usb)" || die "llave AUSENTE: no encuentro ningún pendrive con .llave/key.bin en $USB_SEARCH
-  Enchúfalo y compártelo con Linux desde la app Archivos (clic derecho → Compartir con Linux)."
-  if [[ -f "$LLAVE_HOME/keyid" ]]; then
-    local esperado actual
-    esperado="$(cat "$LLAVE_HOME/keyid")"
-    actual="$(keyid_of "$usb/.llave/key.bin")"
-    [[ "$esperado" == "$actual" ]] || die "pendrive EQUIVOCADO: esperaba la llave $esperado y esta es $actual"
+  if [[ -n "$want" ]]; then
+    usb="$(find_usb "$want")" || die "el ámbito '$amb' lo abre la llave «$(nombre_de "$want")» ($want), y no está puesta.
+  Enchúfala y compártela con Linux desde Archivos (clic derecho → Compartir con Linux)."
+    printf '%s' "$usb"; return 0
   fi
+
+  while IFS=$'\t' read -r id ruta; do
+    conocida "$id" || continue
+    n=$((n+1)); usb="$ruta"
+  done < <(usb_con_llave)
+
+  [[ $n -eq 0 ]] && die "llave AUSENTE: no hay ningún pendrive conocido en $USB_SEARCH
+  Enchúfalo y compártelo con Linux desde Archivos (clic derecho → Compartir con Linux)."
+  [[ $n -gt 1 ]] && die "hay $n llaves puestas a la vez: deja solo la que vas a usar, o di el ámbito"
   printf '%s' "$usb"
 }
 
@@ -152,16 +195,26 @@ hash_set() { # $1 = base; resto = rutas relativas
 
 # ── init ──────────────────────────────────────────────────────────────────────
 cmd_init() {
-  local force=0 usb=""
+  local force=0 usb="" nombre=""
   local -a cands=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force) force=1 ;;
       --usb) usb="${2:-}"; shift ;;
+      --nombre) nombre="${2:-}"; shift ;;
       *) die "opción desconocida: $1" ;;
     esac
     shift
   done
+  if [[ -z "$nombre" ]]; then
+    if [[ -n "${LLAVE_NOMBRE:-}" ]]; then
+      nombre="$LLAVE_NOMBRE"
+    elif [[ -t 0 ]]; then
+      printf '¿Cómo se llama esta llave? (personal, ipnj, lusomagnet…): ' >&2
+      IFS= read -r nombre
+    fi
+    nombre="${nombre:-personal}"
+  fi
 
   if [[ -z "$usb" ]]; then
     mapfile -t cands < <(usb_candidates)
@@ -199,7 +252,7 @@ $(printf '  %s\n' "${cands[@]}")"
 
   local id; id="$(keyid_of "$usb/.llave/key.bin")"
   printf '%s' "$id" > "$usb/.llave/keyid"
-  printf '%s' "$id" > "$LLAVE_HOME/keyid"
+  registrar_llave "$id" "$nombre"
 
   build_pass "$usb"
   canary_write "$usb"
@@ -215,24 +268,34 @@ $(printf '  %s\n' "${cands[@]}")"
   done
   shopt -u nullglob
 
-  ok "llave creada — id $id"
+  ok "llave «$nombre» creada — id $id"
   echo
-  cmd_paper
+  cmd_paper "$id"
 }
 
 # ── adoptar ───────────────────────────────────────────────────────────────────
 # Segunda máquina con el MISMO pendrive: registra aquí una llave ya creada, sin
 # tocarla. (Con un pendrive distinto lo que toca es 'llave init'.)
 cmd_adoptar() {
-  local usb
-  usb="$(find_usb)" || die "no veo ningún pendrive con .llave/key.bin en $USB_SEARCH"
-  [[ -f "$LLAVE_HOME/keyid" ]] && die "esta máquina ya conoce la llave $(cat "$LLAVE_HOME/keyid")"
+  local nombre="${1:-}"
+  local usb id
+  # el primer pendrive con llave que ESTA máquina aún no conozca
+  local kid ruta
+  while IFS=$'\t' read -r kid ruta; do
+    conocida "$kid" || { usb="$ruta"; id="$kid"; break; }
+  done < <(usb_con_llave)
+  [[ -n "${usb:-}" ]] || die "no veo ningún pendrive con una llave que esta máquina no conozca ya"
+
+  if [[ -z "$nombre" ]]; then
+    if [[ -n "${LLAVE_NOMBRE:-}" ]]; then nombre="$LLAVE_NOMBRE"
+    elif [[ -t 0 ]]; then printf '¿Cómo se llama esta llave? (personal, ipnj, lusomagnet…): ' >&2; IFS= read -r nombre; fi
+    nombre="${nombre:-sin-nombre}"
+  fi
 
   read_pin; build_pass "$usb"; canary_check "$usb"
 
-  mkdir -p "$LLAVE_HOME/vault" "$LLAVE_HOME/manifiestos"
-  local id; id="$(keyid_of "$usb/.llave/key.bin")"
-  printf '%s' "$id" > "$LLAVE_HOME/keyid"
+  mkdir -p "$LLAVE_HOME/vault" "$LLAVE_HOME/manifiestos" "$LLAVE_HOME/duenos"
+  registrar_llave "$id" "$nombre"
 
   local plantillas dest p n=0
   plantillas="$(dirname "$(readlink -f "$0")")/../manifiestos"
@@ -241,16 +304,22 @@ cmd_adoptar() {
     dest="$LLAVE_HOME/manifiestos/$(basename "$p")"
     [[ -f "$dest" ]] || cp "$p" "$dest"
   done
-  for p in "$usb/.llave/vault"/*.tar.gpg; do cp "$p" "$LLAVE_HOME/vault/"; n=$((n+1)); done
+  for p in "$usb/.llave/vault"/*.tar.gpg; do
+    cp "$p" "$LLAVE_HOME/vault/"
+    fijar_dueno "$(basename "$p" .tar.gpg)" "$id"   # esas bóvedas las abre ESTA llave
+    n=$((n+1))
+  done
   shopt -u nullglob
 
-  ok "llave $id adoptada en esta máquina ($n bóveda(s) copiadas al espejo local)"
+  ok "llave «$nombre» ($id) adoptada en esta máquina ($n bóveda(s) copiadas al espejo local)"
   info "  Revisa los manifiestos de $LLAVE_HOME/manifiestos antes del primer 'llave lock'."
 }
 
 # ── paper ─────────────────────────────────────────────────────────────────────
 cmd_paper() {
-  local usb; usb="$(need_usb)"
+  local usb
+  if [[ -n "${1:-}" ]]; then usb="$(find_usb "$1")" || die "no encuentro puesta la llave $1"
+  else usb="$(need_usb)"; fi
   local b64 id
   b64="$(base64 -w0 < "$usb/.llave/key.bin")"
   id="$(keyid_of "$usb/.llave/key.bin")"
@@ -263,6 +332,7 @@ cmd_paper() {
 
   clave : $b64
   id    : $id
+  llave : $(nombre_de "$id")
   fecha : $(date +%Y-%m-%d)
 
 EOF
@@ -296,17 +366,20 @@ cmd_restore() {
 
   local id; id="$(keyid_of "$usb/.llave/key.bin")"
   printf '%s' "$id" > "$usb/.llave/keyid"
-  if [[ -f "$LLAVE_HOME/keyid" && "$(cat "$LLAVE_HOME/keyid")" != "$id" ]]; then
+  if ! conocida "$id" && [[ -n "$(ls "$LLAVE_HOME/llaves" 2>/dev/null)" ]]; then
     rm -f "$usb/.llave/key.bin"
-    die "la clave restaurada ($id) no es la de esta máquina ($(cat "$LLAVE_HOME/keyid")): revisa la transcripción del papel"
+    die "la clave restaurada ($id) no es ninguna de las que conoce esta máquina: revisa la transcripción del papel"
   fi
-  printf '%s' "$id" > "$LLAVE_HOME/keyid"
+  conocida "$id" || registrar_llave "$id" "restaurada"
 
-  # Repone el cifrado desde el espejo del disco, si lo hay
+  # Repone desde el espejo SOLO las bóvedas que abre esta llave
   mkdir -p "$LLAVE_HOME/vault"
   local f n=0
   shopt -s nullglob
-  for f in "$LLAVE_HOME/vault"/*.tar.gpg; do cp "$f" "$usb/.llave/vault/"; n=$((n+1)); done
+  for f in "$LLAVE_HOME/vault"/*.tar.gpg; do
+    [[ "$(dueno_de "$(basename "$f" .tar.gpg)")" == "$id" ]] || continue
+    cp "$f" "$usb/.llave/vault/"; n=$((n+1))
+  done
   shopt -u nullglob
 
   read_pin; build_pass "$usb"; canary_write "$usb"; canary_check "$usb"
@@ -315,33 +388,44 @@ cmd_restore() {
 
 # ── status ────────────────────────────────────────────────────────────────────
 cmd_status() {
-  local usb
-  if usb="$(find_usb 2>/dev/null)"; then
-    local id; id="$(keyid_of "$usb/.llave/key.bin")"
-    if [[ -f "$LLAVE_HOME/keyid" && "$(cat "$LLAVE_HOME/keyid")" != "$id" ]]; then
-      warn "hay un pendrive con llave $id, pero esta máquina espera $(cat "$LLAVE_HOME/keyid")"
-    else
-      ok "llave PRESENTE — id $id — $usb"
-    fi
-  else
-    printf '%s✗%s llave AUSENTE (enchufa el pendrive y compártelo con Linux desde Archivos)\n' "$C_ERR" "$C_OFF"
+  local -a conocidas=()
+  mapfile -t conocidas < <(ls "$LLAVE_HOME/llaves" 2>/dev/null || true)
+  if [[ ${#conocidas[@]} -eq 0 ]]; then
+    warn "esta máquina no conoce ninguna llave todavía (llave init, o llave adoptar)"
   fi
+  local id ruta
+  for id in "${conocidas[@]}"; do
+    if ruta="$(find_usb "$id" 2>/dev/null)"; then
+      ok "llave «$(nombre_de "$id")» PRESENTE — $id — $ruta"
+    else
+      printf '%s✗%s llave «%s» ausente — %s\n' "$C_ERR" "$C_OFF" "$(nombre_de "$id")" "$id"
+    fi
+  done
+  local kid
+  while IFS=$'\t' read -r kid ruta; do
+    conocida "$kid" || warn "hay un pendrive con una llave DESCONOCIDA ($kid) en $ruta — usa 'llave adoptar' si es tuya"
+  done < <(usb_con_llave)
 
   local man ambito
   shopt -s nullglob
   for man in "$LLAVE_HOME/manifiestos"/*.txt; do
     ambito="$(basename "$man" .txt)"
-    local abierta="cerrada" vault="—" nclaro=0 rel
+    local abierta="cerrada" vault="—" nclaro=0 rel dueno abre
     [[ -d "$LLAVE_RUNTIME/$ambito" ]] && abierta="ABIERTA (en RAM)"
-    if [[ -n "${usb:-}" && -f "$usb/.llave/vault/$ambito.tar.gpg" ]]; then
-      vault="$(date -r "$usb/.llave/vault/$ambito.tar.gpg" '+%Y-%m-%d %H:%M')"
-    elif [[ -f "$LLAVE_HOME/vault/$ambito.tar.gpg" ]]; then
-      vault="$(date -r "$LLAVE_HOME/vault/$ambito.tar.gpg" '+%Y-%m-%d %H:%M') (solo espejo)"
+    dueno="$(dueno_de "$ambito")"
+    if [[ -n "$dueno" ]]; then
+      abre="«$(nombre_de "$dueno")»$( find_usb "$dueno" >/dev/null 2>&1 || printf ' (no está puesta)' )"
+      if [[ -f "$LLAVE_HOME/vault/$ambito.tar.gpg" ]]; then
+        vault="$(date -r "$LLAVE_HOME/vault/$ambito.tar.gpg" '+%Y-%m-%d %H:%M')"
+      fi
+    else
+      abre="(sin asignar: la fijará el primer 'llave lock')"
     fi
     while IFS= read -r rel; do
       [[ -e "$LLAVE_ROOT/$rel" && ! -L "$LLAVE_ROOT/$rel" ]] && nclaro=$((nclaro+1))
     done < <(read_manifest "$ambito")
     printf '\n  ámbito %-12s %s\n' "$ambito" "$abierta"
+    printf '    lo abre la llave : %s\n' "$abre"
     printf '    bóveda cifrada : %s\n' "$vault"
     printf '    en claro en disco: %s ruta(s)%s\n' "$nclaro" \
       "$( [[ $nclaro -gt 0 ]] && printf ' %s← sin cifrar todavía%s' "$C_WARN" "$C_OFF" )"
@@ -365,7 +449,7 @@ cmd_lock() {
     shift
   done
 
-  local usb; usb="$(need_usb)"
+  local usb; usb="$(need_usb "$ambito")"
   read_pin; build_pass "$usb"; canary_check "$usb"
 
   local -a rels=() presentes=()
@@ -400,6 +484,7 @@ cmd_lock() {
   mkdir -p "$usb/.llave/vault" "$LLAVE_HOME/vault"
   cp "$tmp/nuevo.tar.gpg" "$usb/.llave/vault/$ambito.tar.gpg"
   cp "$tmp/nuevo.tar.gpg" "$LLAVE_HOME/vault/$ambito.tar.gpg"
+  fijar_dueno "$ambito" "$(keyid_of "$usb/.llave/key.bin")"   # este ámbito queda atado a ESTA llave
 
   # 5. ahora sí, retirar el claro
   for rel in "${presentes[@]}"; do rm -rf "${LLAVE_ROOT:?}/$rel"; done
@@ -421,7 +506,7 @@ cmd_unlock() {
     shift
   done
 
-  local usb; usb="$(need_usb)"
+  local usb; usb="$(need_usb "$ambito")"
   read_pin; build_pass "$usb"; canary_check "$usb"
 
   local vault="$usb/.llave/vault/$ambito.tar.gpg"
@@ -461,7 +546,7 @@ cmd_unlock() {
 # ── sync ──────────────────────────────────────────────────────────────────────
 cmd_sync() {
   local ambito="${1:-personal}"
-  local usb; usb="$(need_usb)"
+  local usb; usb="$(need_usb "$ambito")"
   [[ -d "$LLAVE_RUNTIME/$ambito" ]] || die "el ámbito '$ambito' no está abierto: no hay cambios que guardar"
   read_pin; build_pass "$usb"; canary_check "$usb"
 
@@ -603,13 +688,34 @@ cmd_selftest() {
   ok "un PIN incorrecto no abre nada"
 }
 
+# ── llaves ────────────────────────────────────────────────────────────────────
+cmd_llaves() {
+  local -a ids=()
+  mapfile -t ids < <(ls "$LLAVE_HOME/llaves" 2>/dev/null || true)
+  [[ ${#ids[@]} -gt 0 ]] || { info "esta máquina no conoce ninguna llave (llave init, o llave adoptar)"; return 0; }
+  local id amb
+  for id in "${ids[@]}"; do
+    printf '\n  «%s»  %s  %s\n' "$(nombre_de "$id")" "$id" \
+      "$( find_usb "$id" >/dev/null 2>&1 && printf '%sPUESTA%s' "$C_OK" "$C_OFF" || printf 'ausente' )"
+    shopt -s nullglob
+    for amb in "$LLAVE_HOME/duenos"/*; do
+      if [[ "$(cat "$amb")" == "$id" ]]; then
+        printf '      abre el ámbito: %s\n' "$(basename "$amb")"
+      fi
+    done
+    shopt -u nullglob
+  done
+  return 0
+}
+
 # ── ayuda ─────────────────────────────────────────────────────────────────────
 cmd_help() {
   cat <<'EOF'
 llave — el pendrive como llave de credenciales y apps
 
-  llave init [--usb RUTA]     crea la llave en el pendrive, pide PIN, imprime el papel
-  llave adoptar               registra en ESTA máquina una llave ya creada (2.ª máquina)
+  llave init [--nombre X]     crea una llave en el pendrive, pide PIN, imprime el papel
+  llave adoptar [NOMBRE]      registra en ESTA máquina una llave ya creada (2.ª máquina)
+  llave llaves                qué llaves conoce esta máquina y qué ámbito abre cada una
   llave status                ¿está la llave? ¿qué ámbitos hay abiertos o en claro?
   llave lock   [ámbito]       cifra las rutas del manifiesto y las quita del disco
   llave unlock [ámbito]       descifra a RAM y enlaza las rutas reales
@@ -624,13 +730,19 @@ llave — el pendrive como llave de credenciales y apps
 
 El ámbito por defecto es 'personal'. Los manifiestos viven en
 ~/.llave/manifiestos/<ámbito>.txt, con rutas relativas a tu HOME.
+
+Una máquina puede conocer VARIAS llaves, una por entidad (personal, ipnj…). Cada
+ámbito queda atado a la llave con la que se cerró la primera vez: el pendrive de
+IPNJ solo abre lo de IPNJ, y el personal solo lo personal.
 EOF
 }
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
 main() {
   local cmd="${1:-status}"; shift || true
+  migrar_llave_unica
   case "$cmd" in
+    llaves)   cmd_llaves "$@" ;;
     init)     cmd_init "$@" ;;
     adoptar)  cmd_adoptar "$@" ;;
     status)   cmd_status "$@" ;;

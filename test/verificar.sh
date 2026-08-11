@@ -43,8 +43,9 @@ echo; echo "── F1: núcleo de la llave ────────────�
 t "init crea la clave"
 "$LLAVE" init >/dev/null
 assert '[[ "$(stat -c%s "$LLAVE_USB/.llave/key.bin")" == 32 ]]' "key.bin mide 32 bytes"
-assert '[[ -f "$LLAVE_USB/.llave/keyid" && -f "$LLAVE_HOME/keyid" ]]'  "keyid en pendrive y en la máquina"
-assert '[[ "$(cat "$LLAVE_USB/.llave/keyid")" == "$(cat "$LLAVE_HOME/keyid")" ]]' "los dos keyid coinciden"
+assert '[[ -f "$LLAVE_USB/.llave/keyid" ]]' "el pendrive guarda su keyid"
+assert '[[ -f "$LLAVE_HOME/llaves/$(cat "$LLAVE_USB/.llave/keyid")" ]]' "la máquina registra esa llave por su id"
+assert '[[ "$(cat "$LLAVE_HOME/llaves/$(cat "$LLAVE_USB/.llave/keyid")")" == "personal" ]]' "con el nombre que se le dio"
 
 t "init no pisa una llave existente sin --force"
 assert_fail '"$LLAVE" init' "se niega a regenerar la llave"
@@ -123,7 +124,7 @@ assert '[[ ${#PAPEL} -eq 44 ]]' "la clave del papel son 44 caracteres"
 rm -rf "$LLAVE_USB"; mkdir -p "$LLAVE_USB"          # pendrive perdido
 assert_fail '"$LLAVE" status | grep -q PRESENTE' "sin pendrive, status dice AUSENTE"
 LLAVE_PAPER="$PAPEL" "$LLAVE" restore "$LLAVE_USB" >/dev/null
-assert '[[ "$(cat "$LLAVE_USB/.llave/keyid")" == "$(cat "$LLAVE_HOME/keyid")" ]]' "la llave restaurada es la misma"
+assert '[[ -f "$LLAVE_HOME/llaves/$(cat "$LLAVE_USB/.llave/keyid")" ]]' "la llave restaurada es la misma que conocía la máquina"
 assert '[[ -f "$LLAVE_USB/.llave/vault/personal.tar.gpg" ]]' "la bóveda vuelve desde el espejo"
 "$LLAVE" unlock personal --force >/dev/null
 assert '[[ "$(cat "$LLAVE_ROOT/.config/hostinger/token")" == "token-hostinger-NUEVO" ]]' "los secretos vuelven intactos"
@@ -138,13 +139,52 @@ t "otra máquina adopta el mismo pendrive sin tocar la llave"
 KEYID_ORIG="$(cat "$LLAVE_USB/.llave/keyid")"
 M2="$SB/maquina2"; mkdir -p "$M2"
 assert_fail 'LLAVE_HOME="$M2/.llave" LLAVE_ROOT="$M2" "$LLAVE" init' "init se niega: el pendrive ya tiene llave"
-LLAVE_HOME="$M2/.llave" LLAVE_ROOT="$M2" "$LLAVE" adoptar >/dev/null
-assert '[[ "$(cat "$M2/.llave/keyid")" == "$KEYID_ORIG" ]]' "la 2.ª máquina registra la MISMA llave"
+LLAVE_HOME="$M2/.llave" LLAVE_ROOT="$M2" LLAVE_NOMBRE="personal" "$LLAVE" adoptar >/dev/null
+assert '[[ -f "$M2/.llave/llaves/$KEYID_ORIG" ]]' "la 2.ª máquina registra la MISMA llave"
 assert '[[ "$(cat "$LLAVE_USB/.llave/keyid")" == "$KEYID_ORIG" ]]' "la llave del pendrive sigue intacta"
 assert '[[ -f "$M2/.llave/vault/personal.tar.gpg" ]]' "se copia el espejo de la bóveda"
 assert '[[ -f "$M2/.llave/manifiestos/personal.txt" ]]' "se copian los manifiestos"
 assert_fail 'LLAVE_HOME="$M2/.llave" LLAVE_ROOT="$M2" "$LLAVE" adoptar' "no se adopta dos veces"
 assert_fail 'LLAVE_HOME="$M2/.llave" LLAVE_ROOT="$M2" LLAVE_PIN="pin-equivocado" "$LLAVE" adoptar' "adoptar exige el PIN correcto"
+
+echo; echo "── Dos llaves en la misma máquina (personal + ipnj) ───────────────"
+
+t "una segunda llave NO desbanca a la primera"
+KEY_PERSONAL="$(ls "$LLAVE_HOME/llaves")"
+mkdir -p "$SB/usb-ipnj"
+LLAVE_USB="$SB/usb-ipnj" LLAVE_PIN="pin-de-ipnj-999" LLAVE_NOMBRE="ipnj" "$LLAVE" init >/dev/null
+assert '[[ "$(ls "$LLAVE_HOME/llaves" | wc -l)" == 2 ]]' "la máquina conoce ahora 2 llaves"
+assert '[[ -f "$LLAVE_HOME/llaves/$KEY_PERSONAL" ]]' "la llave personal sigue registrada"
+assert '[[ "$(cat "$LLAVE_HOME/llaves/$KEY_PERSONAL")" == "personal" ]]' "conserva su nombre"
+KEY_IPNJ="$(ls "$LLAVE_HOME/llaves" | grep -v "^$KEY_PERSONAL\$")"
+assert '[[ "$(cat "$LLAVE_HOME/llaves/$KEY_IPNJ")" == "ipnj" ]]' "la nueva se llama ipnj"
+
+t "cada ámbito queda atado a SU llave"
+cat > "$LLAVE_HOME/manifiestos/ipnj.txt" <<'EOF'
+.config/cosa-de-ipnj/token
+EOF
+mkdir -p "$LLAVE_ROOT/.config/cosa-de-ipnj"; printf 'token-de-ipnj' > "$LLAVE_ROOT/.config/cosa-de-ipnj/token"
+LLAVE_USB="$SB/usb-ipnj" LLAVE_PIN="pin-de-ipnj-999" "$LLAVE" lock ipnj >/dev/null
+assert '[[ "$(cat "$LLAVE_HOME/duenos/ipnj")" == "$KEY_IPNJ" ]]' "el ámbito ipnj apunta a la llave ipnj"
+assert '[[ "$(cat "$LLAVE_HOME/duenos/personal")" == "$KEY_PERSONAL" ]]' "el ámbito personal apunta a la personal"
+
+t "la llave equivocada NO abre el ámbito ajeno"
+assert_fail 'LLAVE_USB="$SB/usb-ipnj" LLAVE_PIN="pin-de-ipnj-999" "$LLAVE" unlock personal' \
+            "con el pendrive de ipnj no se abre lo personal"
+assert_fail 'LLAVE_PIN="$LLAVE_PIN" "$LLAVE" unlock ipnj' "con el pendrive personal no se abre lo de ipnj"
+assert '[[ ! -e "$LLAVE_ROOT/.config/cosa-de-ipnj/token" ]]' "el secreto de ipnj sigue cifrado"
+
+t "cada llave sí abre lo suyo"
+LLAVE_USB="$SB/usb-ipnj" LLAVE_PIN="pin-de-ipnj-999" "$LLAVE" unlock ipnj >/dev/null
+assert '[[ "$(cat "$LLAVE_ROOT/.config/cosa-de-ipnj/token")" == "token-de-ipnj" ]]' "la llave ipnj abre el ámbito ipnj"
+"$LLAVE" unlock personal --force >/dev/null
+assert '[[ "$(cat "$LLAVE_ROOT/.config/hostinger/token")" == "token-hostinger-NUEVO" ]]' "la llave personal abre el ámbito personal"
+
+t "llaves las lista con su dueño"
+# Captura en vez de tubería: con `| grep -q` la aserción resultaba intermitente
+# (grep cierra el pipe en cuanto casa), y lo que se quiere comprobar es el listado entero.
+assert 'grep -q "abre el ámbito: ipnj" <<<"$("$LLAVE" llaves)"' "dice qué ámbito abre la llave ipnj"
+assert 'grep -q "abre el ámbito: personal" <<<"$("$LLAVE" llaves)"' "y cuál abre la personal"
 
 echo; echo "── F3: candado de apps ────────────────────────────────────────────"
 
